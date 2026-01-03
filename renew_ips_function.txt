@@ -1,0 +1,216 @@
+    try:
+        ak = self.ak.get().strip()
+        fi = self.fmt.current()
+        reg = self.reg.get().split()[0]
+        sel = [{'id': iid, 'ak': d['access_key'], 'sk': d['secret_key'], 'reg': d['region']} 
+               for iid, d in self.instance_checkboxes.items() if d['var'].get()]
+        
+        if not sel:  
+            return messagebox.showwarning("Canh Bao", "Vui long chon VPS!")
+        
+        if not messagebox.askyesno("Xac Nhan", f"Doi IP cho {len(sel)} VPS?\n\nPhuong phap: STOP → START (DONG THOI)"):
+            return
+        
+        stats = self.usage_counter.get_stats(ak)
+        self.out_m.delete(1.0, tk.END)
+        self.out_m.insert(tk.END, f"THONG KE TRUOC KHI DOI:\n")
+        self.out_m.insert(tk.END, f"- Tong doi IP: {stats['ip_changes']}\n")
+        self.out_m.insert(tk.END, f"- Tong xoa VPS: {stats['vps_deletions']}\n\n")
+        self.out_m.insert(tk.END, f"{'='*50}\n")
+        self.out_m.insert(tk.END, f"PHUONG PHAP: STOP → START DONG THOI {len(sel)} VPS\n")
+        self.out_m.insert(tk.END, f"{'='*50}\n\n")
+        self.root.update()
+        
+        loading = LoadingDialog(self.root, "Dang Doi IP", f"Buoc 1/3: STOP {len(sel)} VPS...", len(sel) * 3)
+        
+        # ===== BUOC 1: NHOM VPS THEO REGION =====
+        self.out_m.insert(tk.END, f"BUOC 1: DANG STOP {len(sel)} VPS DONG THOI...\n\n")
+        self.root.update()
+        
+        vps_by_region = {}
+        for s in sel:
+            key = (s['ak'], s['sk'], s['reg'])
+            if key not in vps_by_region:
+                vps_by_region[key] = []
+            vps_by_region[key].append(s['id'])
+        
+        # ===== STOP TAT CA VPS CUNG LUC =====
+        stop_success = []
+        for (ak_key, sk_key, reg_key), instance_ids in vps_by_region.items():
+            try:
+                ec2 = boto3.client('ec2', aws_access_key_id=ak_key, aws_secret_access_key=sk_key, region_name=reg_key)
+                
+                # Kiem tra trang thai
+                inf = ec2.describe_instances(InstanceIds=instance_ids)
+                running_ids = []
+                for reservation in inf['Reservations']:
+                    for instance in reservation['Instances']:
+                        state = instance['State']['Name']
+                        if state == 'running':
+                            running_ids.append(instance['InstanceId'])
+                        elif state == 'stopped': 
+                            stop_success.append({'id': instance['InstanceId'], 'ak': ak_key, 'sk': sk_key, 'reg': reg_key})
+                            self.out_m.insert(tk.END, f"[{instance['InstanceId'][:10]}...] ⏸️ DA DUNG SAN\n")
+                
+                # STOP tat ca VPS running cung luc
+                if running_ids:
+                    ec2.stop_instances(InstanceIds=running_ids)
+                    for iid in running_ids:
+                        stop_success.append({'id': iid, 'ak': ak_key, 'sk': sk_key, 'reg': reg_key})
+                        self.out_m.insert(tk.END, f"[{iid[:10]}...] ✅ STOP OK\n")
+                
+            except Exception as e:
+                self.out_m.insert(tk.END, f"❌ LOI: {str(e)[:50]}\n")
+            
+            self.out_m.see(tk.END)
+            self.root.update()
+        
+        if not stop_success:
+            loading.close()
+            self.out_m.insert(tk.END, f"\n❌ KHONG STOP DUOC VPS NAO!")
+            messagebox.showerror("Loi", "Khong stop duoc VPS nao!")
+            return
+        
+        loading.update(len(sel), "Buoc 1 hoan tat")
+        
+        # ===== BUOC 2: DOI TAT CA VPS STOP HOAN TOAN =====
+        self.out_m.insert(tk.END, f"\n{'='*50}\n")
+        self.out_m.insert(tk.END, f"BUOC 2: DOI VPS STOP HOAN TOAN (60s)...\n\n")
+        self.root.update()
+        
+        # Doi tat ca VPS stop (theo region)
+        for (ak_key, sk_key, reg_key), instance_ids in vps_by_region.items():
+            try:
+                ec2 = boto3.client('ec2', aws_access_key_id=ak_key, aws_secret_access_key=sk_key, region_name=reg_key)
+                waiter = ec2.get_waiter('instance_stopped')
+                waiter.wait(InstanceIds=instance_ids)
+            except: 
+                pass
+        
+        # Countdown
+        for countdown in range(60, 0, -1):
+            loading.update(len(sel) + (60 - countdown), f"Doi VPS stop: {countdown}s...")
+            self.upd(f"Doi {countdown}s...")
+            if countdown % 10 == 0:
+                self.out_m.insert(tk.END, f"{countdown}s... ")
+                self.out_m.see(tk.END)
+            self.root.update()
+            time.sleep(1)
+        
+        self.out_m.insert(tk.END, f"\n✅ HOAN TAT!\n\n")
+        
+        # ===== BUOC 3: START TAT CA VPS CUNG LUC =====
+        self.out_m.insert(tk.END, f"{'='*50}\n")
+        self.out_m.insert(tk.END, f"BUOC 3: DANG START {len(stop_success)} VPS DONG THOI...\n\n")
+        self.root.update()
+        
+        # START tat ca VPS cung luc (theo region)
+        for (ak_key, sk_key, reg_key), instance_ids in vps_by_region.items():
+            try:
+                ec2 = boto3.client('ec2', aws_access_key_id=ak_key, aws_secret_access_key=sk_key, region_name=reg_key)
+                ec2.start_instances(InstanceIds=instance_ids)
+                self.out_m.insert(tk.END, f"Region {reg_key}: START {len(instance_ids)} VPS ✅\n")
+            except Exception as e:
+                self.out_m.insert(tk.END, f"Region {reg_key}: ❌ {str(e)[:50]}\n")
+            self.root.update()
+        
+        # Doi tat ca VPS start (theo region)
+        for (ak_key, sk_key, reg_key), instance_ids in vps_by_region.items():
+            try:
+                ec2 = boto3.client('ec2', aws_access_key_id=ak_key, aws_secret_access_key=sk_key, region_name=reg_key)
+                waiter = ec2.get_waiter('instance_running')
+                waiter.wait(InstanceIds=instance_ids)
+            except:
+                pass
+        
+        loading.update(len(sel) * 3, "Dang lay IP moi...")
+        self.out_m.insert(tk.END, f"\n✅ TAT CA VPS DA START!\n\n")
+        
+        # ===== LAY IP MOI CHO TAT CA VPS =====
+        new_ips = []
+        for s in stop_success:
+            try:
+                ec2 = boto3.client('ec2', aws_access_key_id=s['ak'], aws_secret_access_key=s['sk'], region_name=s['reg'])
+                inf = ec2.describe_instances(InstanceIds=[s['id']])
+                instance = inf['Reservations'][0]['Instances'][0]
+                new_ip = instance.get('PublicIpAddress')
+                
+                if new_ip:
+                    # Lay user/pass
+                    user = "proxyuser"
+                    password = "Pass123"
+                    if s['id'] in self.instance_checkboxes:
+                        user = self.instance_checkboxes[s['id']]['instance'].get('proxy_user', 'proxyuser')
+                        password = self.instance_checkboxes[s['id']]['instance'].get('proxy_pass', 'Pass123')
+                    
+                    proxy = self.fmt_px(new_ip, fi, user, password)
+                    new_ips.append({'id': s['id'], 'ip': new_ip, 'proxy': proxy})
+                    
+                    # Cap nhat UI
+                    if s['id'] in self.instance_checkboxes:
+                        self.instance_checkboxes[s['id']]['instance']['public_ip'] = new_ip
+                        proxy_label = self.instance_checkboxes[s['id']].get('proxy_label')
+                        copy_btn = self.instance_checkboxes[s['id']].get('copy_btn')
+                        
+                        if proxy_label: 
+                            proxy_label.config(text=f"→ {proxy}")
+                            proxy_label.pack(side=tk.LEFT, padx=5)
+                        if copy_btn:
+                            copy_btn.config(command=lambda p=proxy: self.copy_single_proxy(p))
+                            copy_btn.pack(side=tk.LEFT, padx=2)
+                    
+                    self.out_m.insert(tk.END, f"[{s['id'][:10]}...] ✅ IP: {new_ip}\n")
+                else:
+                    self.out_m.insert(tk.END, f"[{s['id'][:10]}...] ⚠️ CHUA CO IP\n")
+            except Exception as e:
+                self.out_m.insert(tk.END, f"[{s['id'][:10]}...] ❌ {str(e)[:30]}\n")
+            
+            self.out_m.see(tk.END)
+            self.root.update()
+        
+        loading.close()
+        
+        # ===== KET QUA =====
+        if new_ips:
+            self.usage_counter.increment_ip(ak, len(new_ips))
+            new_stats = self.usage_counter.get_stats(ak)
+            
+            threading.Thread(
+                target=UsageReporter.report_usage,
+                args=(ak, new_stats['ip_changes'], new_stats['vps_deletions'], 'ip_change', 
+                      {'count': len(new_ips), 'region': reg, 'method': 'STOP-START-PARALLEL'}),
+                daemon=True
+            ).start()
+            
+            self.out_m.insert(tk.END, f"\n{'='*50}\n")
+            self.out_m.insert(tk.END, f"✅ KET QUA DOI IP:\n\n")
+            self.out_m.insert(tk.END, f"Thanh cong: {len(new_ips)}/{len(sel)}\n")
+            self.out_m.insert(tk.END, f"That bai: {len(sel) - len(new_ips)}\n\n")
+            self.out_m.insert(tk.END, f"DANH SACH IP MOI:\n\n")
+            
+            for idx, item in enumerate(new_ips, 1):
+                self.out_m.insert(tk.END, f"[{idx}] {item['id'][:10]}...\n")
+                self.out_m.insert(tk.END, f"    IP: {item['ip']}\n")
+                self.out_m.insert(tk.END, f"    Proxy: {item['proxy']}\n\n")
+            
+            self.out_m.insert(tk.END, f"{'='*50}\n")
+            self.out_m.insert(tk.END, f"TONG DOI IP: {new_stats['ip_changes']}\n")
+            self.out_m.see(tk.END)
+            
+            self.upd("Dang lam moi danh sach...")
+            self.root.after(1000, lambda: threading.Thread(target=self.load_vps, daemon=True).start())
+            
+            messagebox.showinfo("✅ THANH CONG", 
+                f"Da doi {len(new_ips)}/{len(sel)} IP!\n\n"
+                f"Phuong phap: STOP → START (DONG THOI)\n"
+                f"Tong doi IP: {new_stats['ip_changes']}\n\n"
+                f"Danh sach dang tu dong lam moi...")
+        else:
+            self.out_m.insert(tk.END, f"\n❌ KHONG DOI DUOC IP NAO!\n")
+            messagebox.showerror("Loi", "Khong doi duoc IP nao!")
+            
+    except Exception as e:
+        self.out_m.insert(tk.END, f"\n\n❌ LOI: {str(e)}")
+        messagebox.showerror("Loi", str(e))
+        import traceback
+        traceback.print_exc()
