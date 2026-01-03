@@ -1,0 +1,195 @@
+def renew_ips(vps_ids):
+    """
+    Renew IPs for multiple VPS instances using STOP→START method.
+    
+    This function performs IP renewal in two parallel phases:
+    1. STOP phase: Stop all VPS instances in parallel
+    2. START phase: Start all VPS instances in parallel
+    
+    This approach is more efficient than stopping and starting each VPS sequentially.
+    
+    Args:
+        vps_ids (list): List of VPS instance IDs to renew IPs for
+        
+    Returns:
+        dict: Dictionary with renewal results for each VPS
+              Format: {vps_id: {'success': bool, 'old_ip': str, 'new_ip': str, 'error': str}}
+    """
+    import concurrent.futures
+    import time
+    
+    results = {}
+    old_ips = {}
+    
+    # Store original IPs before stopping
+    print(f"Collecting current IPs for {len(vps_ids)} VPS instances...")
+    for vps_id in vps_ids:
+        try:
+            vps_info = get_vps_info(vps_id)
+            old_ips[vps_id] = vps_info.get('ip_address', 'unknown')
+            print(f"  VPS {vps_id}: Current IP = {old_ips[vps_id]}")
+        except Exception as e:
+            old_ips[vps_id] = 'unknown'
+            print(f"  VPS {vps_id}: Could not retrieve IP - {str(e)}")
+    
+    # Phase 1: STOP all VPS instances in parallel
+    print(f"\n[PHASE 1] Stopping {len(vps_ids)} VPS instances in parallel...")
+    stop_results = {}
+    
+    def stop_vps(vps_id):
+        try:
+            print(f"  Stopping VPS {vps_id}...")
+            response = stop_vps_instance(vps_id)
+            print(f"  VPS {vps_id}: Stop initiated successfully")
+            return {'success': True, 'response': response}
+        except Exception as e:
+            print(f"  VPS {vps_id}: Stop failed - {str(e)}")
+            return {'success': False, 'error': str(e)}
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_vps = {executor.submit(stop_vps, vps_id): vps_id for vps_id in vps_ids}
+        
+        for future in concurrent.futures.as_completed(future_to_vps):
+            vps_id = future_to_vps[future]
+            stop_results[vps_id] = future.result()
+    
+    # Wait for all VPS instances to fully stop
+    print(f"\nWaiting for all VPS instances to stop completely...")
+    max_wait_time = 60  # seconds
+    wait_interval = 5   # seconds
+    elapsed = 0
+    
+    while elapsed < max_wait_time:
+        all_stopped = True
+        for vps_id in vps_ids:
+            if stop_results[vps_id]['success']:
+                try:
+                    status = get_vps_status(vps_id)
+                    if status != 'stopped':
+                        all_stopped = False
+                        break
+                except Exception:
+                    pass
+        
+        if all_stopped:
+            print(f"  All VPS instances stopped after {elapsed} seconds")
+            break
+        
+        time.sleep(wait_interval)
+        elapsed += wait_interval
+        print(f"  Waiting... ({elapsed}s elapsed)")
+    
+    # Phase 2: START all VPS instances in parallel
+    print(f"\n[PHASE 2] Starting {len(vps_ids)} VPS instances in parallel...")
+    
+    def start_vps(vps_id):
+        if not stop_results[vps_id]['success']:
+            return {
+                'success': False, 
+                'error': f"Skipped start because stop failed: {stop_results[vps_id]['error']}"
+            }
+        
+        try:
+            print(f"  Starting VPS {vps_id}...")
+            response = start_vps_instance(vps_id)
+            print(f"  VPS {vps_id}: Start initiated successfully")
+            return {'success': True, 'response': response}
+        except Exception as e:
+            print(f"  VPS {vps_id}: Start failed - {str(e)}")
+            return {'success': False, 'error': str(e)}
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_vps = {executor.submit(start_vps, vps_id): vps_id for vps_id in vps_ids}
+        
+        for future in concurrent.futures.as_completed(future_to_vps):
+            vps_id = future_to_vps[future]
+            start_result = future.result()
+            
+            if start_result['success']:
+                results[vps_id] = {
+                    'success': True,
+                    'old_ip': old_ips.get(vps_id, 'unknown'),
+                    'new_ip': 'pending',  # Will be updated below
+                    'error': None
+                }
+            else:
+                results[vps_id] = {
+                    'success': False,
+                    'old_ip': old_ips.get(vps_id, 'unknown'),
+                    'new_ip': None,
+                    'error': start_result['error']
+                }
+    
+    # Wait for all VPS instances to be running and collect new IPs
+    print(f"\nWaiting for all VPS instances to start and collecting new IPs...")
+    max_wait_time = 120  # seconds
+    wait_interval = 5    # seconds
+    elapsed = 0
+    
+    vps_to_check = [vps_id for vps_id in vps_ids if results[vps_id]['success']]
+    
+    while elapsed < max_wait_time and vps_to_check:
+        time.sleep(wait_interval)
+        elapsed += wait_interval
+        
+        for vps_id in list(vps_to_check):
+            try:
+                status = get_vps_status(vps_id)
+                if status == 'running':
+                    vps_info = get_vps_info(vps_id)
+                    new_ip = vps_info.get('ip_address', 'unknown')
+                    results[vps_id]['new_ip'] = new_ip
+                    print(f"  VPS {vps_id}: Running - New IP = {new_ip}")
+                    vps_to_check.remove(vps_id)
+            except Exception as e:
+                print(f"  VPS {vps_id}: Error checking status - {str(e)}")
+        
+        if vps_to_check:
+            print(f"  Still waiting for {len(vps_to_check)} VPS instances... ({elapsed}s elapsed)")
+    
+    # Summary
+    print(f"\n{'='*60}")
+    print(f"IP RENEWAL SUMMARY")
+    print(f"{'='*60}")
+    successful = sum(1 for r in results.values() if r['success'])
+    failed = len(results) - successful
+    
+    print(f"Total VPS: {len(vps_ids)}")
+    print(f"Successful: {successful}")
+    print(f"Failed: {failed}")
+    print(f"\nDetailed Results:")
+    
+    for vps_id, result in results.items():
+        if result['success']:
+            ip_changed = result['old_ip'] != result['new_ip']
+            status = "✓ IP CHANGED" if ip_changed else "✓ COMPLETED"
+            print(f"  VPS {vps_id}: {status}")
+            print(f"    Old IP: {result['old_ip']}")
+            print(f"    New IP: {result['new_ip']}")
+        else:
+            print(f"  VPS {vps_id}: ✗ FAILED")
+            print(f"    Error: {result['error']}")
+    
+    print(f"{'='*60}\n")
+    
+    return results
+
+
+# Example usage:
+if __name__ == "__main__":
+    # Example: Renew IPs for multiple VPS instances
+    vps_list = ['vps-001', 'vps-002', 'vps-003', 'vps-004', 'vps-005']
+    
+    print("Starting parallel IP renewal process...")
+    print(f"Target VPS instances: {vps_list}\n")
+    
+    renewal_results = renew_ips(vps_list)
+    
+    # Check if all renewals were successful
+    all_successful = all(r['success'] for r in renewal_results.values())
+    
+    if all_successful:
+        print("✓ All IP renewals completed successfully!")
+    else:
+        failed_vps = [vps_id for vps_id, r in renewal_results.items() if not r['success']]
+        print(f"✗ Some renewals failed: {failed_vps}")
